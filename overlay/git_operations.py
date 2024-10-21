@@ -11,7 +11,7 @@ def run_git_command(command):
         logging.debug(f"Changing directory to: {overlay_path}")
         os.chdir(overlay_path)
     else:
-        logging.warning("Warning: Overlay path not set. Using current directory.")
+        print("Warning: Overlay path not set. Using current directory.")
     
     logging.debug(f"Executing git command: {' '.join(command)}")
     try:
@@ -19,66 +19,55 @@ def run_git_command(command):
         logging.debug("Command executed successfully")
         return result.stdout
     except subprocess.CalledProcessError as e:
-        logging.error(f"Error executing git command: {e.stderr}")
+        print(f"Error executing git command: {e.stderr}")
+        logging.error(f"Command that failed: {' '.join(command)}")
         return None
 
 def generate_commit_description(git_status):
-    changes = defaultdict(lambda: defaultdict(dict))
-    eclass_changes = defaultdict(list)
+    changes = defaultdict(dict)
     
+    def compare_versions(v1, v2):
+        def normalize(v):
+            return [int(x) for x in re.findall(r'\d+', v)]
+        return (normalize(v1) > normalize(v2)) - (normalize(v1) < normalize(v2))
+
     for line in git_status.split('\n'):
         if not line.strip():
             continue
         status, file_path = line[:2], line[3:].strip()
         
-        # Ignore metadata.xml and Manifest files
-        if file_path.endswith('metadata.xml') or file_path.endswith('Manifest'):
-            continue
-        
-        ebuild_match = re.match(r'(.+)/(.+)/(.+)-(\d+[\d.]+\d+)\.ebuild$', file_path)
+        ebuild_match = re.match(r'(.+)/(.+)/(.+)-(\d+[\d.]+[\d\w-]*)\.ebuild$', file_path)
         if ebuild_match:
             category, package, name, version = ebuild_match.groups()
+            full_package = f"{category}/{package}"
             if status.startswith('A'):
-                changes['add'][category][package] = version
-            elif status.startswith('M'):
-                changes['up'][category][package] = version
+                changes['add'][full_package] = version
             elif status.startswith('D'):
-                changes['del'][category][package] = version
-        elif file_path.endswith('.eclass'):
-            eclass_name = os.path.basename(file_path)
-            if status.startswith('A'):
-                eclass_changes['add'].append(eclass_name)
+                changes['del'][full_package] = version
             elif status.startswith('M'):
-                eclass_changes['up'].append(eclass_name)
-            elif status.startswith('D'):
-                eclass_changes['del'].append(eclass_name)
-
-    def format_packages(category, packages):
-        if len(packages) == 1:
-            package, version = next(iter(packages.items()))
-            return f"{category}/{package}-{version}"
-        else:
-            sorted_packages = sorted(packages.items())
-            
-            if len(sorted_packages) == 2:
-                pkg1, ver1 = sorted_packages[0]
-                pkg2, ver2 = sorted_packages[1]
-                if pkg1 in pkg2 or pkg2 in pkg1:
-                    diff = pkg2.replace(pkg1, '') if len(pkg2) > len(pkg1) else pkg1.replace(pkg2, '')
-                    return f"{category}/{pkg1}{{,{diff}}}-{ver1}"
-            
-            formatted = ", ".join(f"{pkg}-{ver}" for pkg, ver in sorted_packages)
-            return f"{category}/{{{formatted}}}"
+                changes['mod'][full_package] = version
+            elif status.startswith('R'):
+                old_path, new_path = file_path.split(' -> ')
+                old_match = re.match(r'(.+)/(.+)/(.+)-(\d+[\d.]+[\d\w-]*)\.ebuild$', old_path)
+                new_match = re.match(r'(.+)/(.+)/(.+)-(\d+[\d.]+[\d\w-]*)\.ebuild$', new_path)
+                if old_match and new_match:
+                    old_version = old_match.group(4)
+                    new_version = new_match.group(4)
+                    if compare_versions(new_version, old_version) > 0:
+                        changes['up'][full_package] = f"{old_version} -> {new_version}"
+                    else:
+                        changes['down'][full_package] = f"{old_version} -> {new_version}"
 
     description_parts = []
     
-    for action in ['add', 'up', 'del']:
+    for action in ['add', 'del', 'mod', 'up', 'down']:
         if changes[action]:
-            action_str = f"{action}(" + ", ".join(format_packages(cat, pkgs) for cat, pkgs in sorted(changes[action].items())) + ")"
-            description_parts.append(action_str)
-        if eclass_changes[action]:
-            eclass_str = f"{action}_eclass(" + ", ".join(sorted(eclass_changes[action])) + ")"
-            description_parts.append(eclass_str)
+            for pkg, ver in sorted(changes[action].items()):
+                if action in ['up', 'down']:
+                    action_str = f"{action}({pkg}-{ver})"
+                else:
+                    action_str = f"{action}({pkg}-{ver})"
+                description_parts.append(action_str)
     
     return ", ".join(description_parts)
 
@@ -95,33 +84,45 @@ def git_commit():
     status_output = git_status()
     if status_output:
         commit_description = generate_commit_description(status_output)
+        if not commit_description:
+            print("No changes detected that require a commit description.")
+            print("Current status:")
+            print(status_output)
+            return None
+        
         while True:
-            logging.info("Proposed commit description:")
-            logging.info(commit_description)
-            confirm = input("Is this description correct? (yes/no/edit): ").lower()
-            if confirm == 'yes':
+            print("Proposed commit description:")
+            print(commit_description)
+            confirm = input("Options: (y)es to confirm, (e)dit to modify, (c)ancel to abort: ").lower()
+            if confirm == 'y':
                 break
-            elif confirm == 'edit':
+            elif confirm == 'e':
                 commit_description = input("Enter your commit description: ")
-                break
-            elif confirm == 'no':
-                logging.info("Commit cancelled.")
+                continue
+            elif confirm == 'c':
+                print("Commit cancelled.")
                 return None
             else:
-                logging.info("Invalid input. Please enter 'yes', 'no', or 'edit'.")
+                print("Invalid input. Please enter 'y', 'e', or 'c'.")
 
         user, email = get_git_user()
         result = run_git_command(['git', '-c', f'user.name={user}', '-c', f'user.email={email}', 'commit', '-m', commit_description])
         if result:
-            logging.info("Changes committed successfully.")
+            print(f"Changes committed successfully with description: {commit_description}")
             return result
         else:
-            logging.error("Failed to commit changes.")
+            print("Failed to commit changes.")
             return None
     else:
-        logging.info("No changes to commit.")
+        print("No changes to commit.")
         return None
 
 def git_push():
     logging.debug("Pushing changes to remote")
-    return run_git_command(['git', 'push'])
+    result = run_git_command(['git', 'push'])
+    if result:
+        print("Changes pushed successfully.")
+        return result
+    else:
+        print("Failed to push changes or nothing to push.")
+        return None
